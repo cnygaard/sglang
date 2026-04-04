@@ -28,6 +28,7 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8Config
 from sglang.srt.layers.quantization.gguf import GGUFConfig
+from sglang.srt.layers.quantization.glq import GLQConfig
 from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
 from sglang.srt.layers.quantization.gptq_cpu import CPUGPTQConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
@@ -73,6 +74,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "awq_marlin": AWQMarlinConfig,
     "bitsandbytes": BitsAndBytesConfig,
     "gguf": GGUFConfig,
+    "glq": GLQConfig,
     "gptq": GPTQConfig,
     "gptq_marlin": GPTQMarlinConfig,
     "moe_wna16": MoeWNA16Config,

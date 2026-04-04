@@ -108,6 +108,7 @@ QUANTIZATION_CHOICES = [
     "awq_marlin",
     "bitsandbytes",
     "gguf",
+    "glq",
     "modelopt",
     "modelopt_fp8",
     "modelopt_fp4",
