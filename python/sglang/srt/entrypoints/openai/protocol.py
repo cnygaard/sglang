@@ -327,8 +327,8 @@ class CompletionRequest(BaseModel):
     @field_validator("max_tokens")
     @classmethod
     def validate_max_tokens_positive(cls, v):
-        if v is not None and v <= 0:
-            raise ValueError("max_tokens must be positive")
+        if v is not None and v < 0:
+            raise ValueError("max_tokens must be non-negative")
         return v
 
 
