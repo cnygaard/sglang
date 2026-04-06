@@ -798,10 +798,15 @@ class NemotronHForCausalLM(nn.Module):
 
         def _flush_expert(base, bufs):
             from glq.codebook import E8ShellCodebook
-            from glq.hadamard import _pytorch_fht
-            cb = E8ShellCodebook(device="cpu", verbose=False)
-            q = bufs[".Qidxs"]
-            su, sv, ws = bufs[".SU"], bufs[".SV"], bufs[".Wscale"]
+            from glq.hadamard import fast_hadamard_transform
+            dev = "cuda"
+            if not hasattr(_flush_expert, "_cb"):
+                _flush_expert._cb = E8ShellCodebook(device=dev, verbose=False)
+            cb = _flush_expert._cb
+            q = bufs[".Qidxs"].to(dev)
+            su = bufs[".SU"].to(dev)
+            sv = bufs[".SV"].to(dev)
+            ws = bufs[".Wscale"].to(dev)
             m_pad, n_blocks = q.shape
             n_pad = n_blocks * 8
             W = cb.decode(q.long().reshape(-1)).reshape(m_pad, n_pad).float()
@@ -809,19 +814,19 @@ class NemotronHForCausalLM(nn.Module):
             inv_rs = bufs.get(".inv_resid_scale")
             inv_rs_val = inv_rs.item() if inv_rs is not None and inv_rs.numel() == 1 else 0.0
             if q2 is not None and inv_rs_val != 0.0:
-                W2 = cb.decode(q2.long().reshape(-1)).reshape(m_pad, n_pad).float()
+                W2 = cb.decode(q2.to(dev).long().reshape(-1)).reshape(m_pad, n_pad).float()
                 W = W + W2 * inv_rs_val
             W = W * ws.float()
-            W = _pytorch_fht(W.clone())
+            W = fast_hadamard_transform(W.clone())
             W = W * sv.float().unsqueeze(0)
-            W = _pytorch_fht(W.T.clone()).T
+            W = fast_hadamard_transform(W.T.contiguous().clone()).T
             W = W * su.float().unsqueeze(1)
             # Crop to unpadded shape using model config
             if "up_proj" in base:
                 W = W[:moe_inter, :hidden]
             elif "down_proj" in base:
                 W = W[:hidden, :moe_inter]
-            return base + ".weight", W.half()
+            return base + ".weight", W.half().cpu()
 
         for name, tensor in weights:
             is_glq_expert = False
