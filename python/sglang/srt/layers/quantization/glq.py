@@ -43,8 +43,8 @@ from glq.inference_kernel import glq_dequant_matmul, _try_load_cuda_ext
 def _dequantize_glq_weight(Qidxs, SU, SV, Wscale, codebook,
                            Qidxs2=None, inv_resid_scale=0.0, codebook2=None,
                            out_features=None, in_features=None):
-    """Dequantize GLQ indices to a dense fp16 weight matrix."""
-    from glq.hadamard import fast_hadamard_transform
+    """Dequantize GLQ indices to a dense fp16 weight matrix (CPU)."""
+    from glq.hadamard import _pytorch_fht as fast_hadamard_transform
     m_pad, n_blocks = Qidxs.shape
     n_pad = n_blocks * 8
     W_rht = codebook.decode(Qidxs.long().reshape(-1)).reshape(m_pad, n_pad).float()
@@ -54,7 +54,7 @@ def _dequantize_glq_weight(Qidxs, SU, SV, Wscale, codebook,
     W_rht = W_rht * Wscale.float()
     W = fast_hadamard_transform(W_rht.clone())
     W = W * SV.float().unsqueeze(0)
-    W = fast_hadamard_transform(W.T.contiguous().clone()).T
+    W = fast_hadamard_transform(W.T.clone()).T
     W = W * SU.float().unsqueeze(1)
     if out_features is not None and in_features is not None:
         W = W[:out_features, :in_features]
@@ -527,15 +527,14 @@ class GLQLinearMethod(LinearMethodBase):
         # Dequantize to dense fp16 and use F.linear at inference time.
         if (getattr(layer, "glq_is_fused", False)
                 and hasattr(layer.Qidxs, "_unsplit_weight")):
-            dev = str(device)
-            cb = E8ShellCodebook(device=dev, verbose=False)
-            q = layer.Qidxs._unsplit_weight.to(dev)
-            su = layer.SU._unsplit_weight.to(dev)
-            sv = layer.SV._unsplit_weight.to(dev)
-            ws = layer.Wscale._unsplit_weight.to(dev)
+            cb = E8ShellCodebook(device="cpu", verbose=False)
+            q = layer.Qidxs._unsplit_weight.cpu()
+            su = layer.SU._unsplit_weight.cpu()
+            sv = layer.SV._unsplit_weight.cpu()
+            ws = layer.Wscale._unsplit_weight.cpu()
             inv_rs_t = getattr(layer.inv_resid_scale, "_unsplit_weight", None)
-            inv_rs = inv_rs_t.item() if inv_rs_t is not None and inv_rs_t.numel() == 1 else 0.0
-            q2 = layer.Qidxs2._unsplit_weight.to(dev) if (
+            inv_rs = inv_rs_t.cpu().item() if inv_rs_t is not None and inv_rs_t.numel() == 1 else 0.0
+            q2 = layer.Qidxs2._unsplit_weight.cpu() if (
                 inv_rs != 0.0 and hasattr(layer.Qidxs2, "_unsplit_weight")
             ) else None
             cb2 = cb if inv_rs != 0.0 else None
