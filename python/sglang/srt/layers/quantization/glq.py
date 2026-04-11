@@ -20,7 +20,6 @@ import os
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
-import torch.nn.functional as F
 
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.parameter import BasevLLMParameter
@@ -34,31 +33,6 @@ from sglang.srt.layers.quantization.base_config import (
 from glq import inference_kernel as _ik
 from glq.codebook import E8ShellCodebook
 from glq.inference_kernel import glq_dequant_matmul, _try_load_cuda_ext
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# Dense dequantization (for Mamba layers that can't use compressed kernels)
-# ──────────────────────────────────────────────────────────────────────────
-
-def _dequantize_glq_weight(Qidxs, SU, SV, Wscale, codebook,
-                           Qidxs2=None, inv_resid_scale=0.0, codebook2=None,
-                           out_features=None, in_features=None):
-    """Dequantize GLQ indices to a dense fp16 weight matrix (CPU)."""
-    from glq.hadamard import _pytorch_fht as fast_hadamard_transform
-    m_pad, n_blocks = Qidxs.shape
-    n_pad = n_blocks * 8
-    W_rht = codebook.decode(Qidxs.long().reshape(-1)).reshape(m_pad, n_pad).float()
-    if Qidxs2 is not None and inv_resid_scale != 0.0 and codebook2 is not None:
-        W_rht2 = codebook2.decode(Qidxs2.long().reshape(-1)).reshape(m_pad, n_pad).float()
-        W_rht = W_rht + W_rht2 * inv_resid_scale
-    W_rht = W_rht * Wscale.float()
-    W = fast_hadamard_transform(W_rht.clone())
-    W = W * SV.float().unsqueeze(0)
-    W = fast_hadamard_transform(W.T.clone()).T
-    W = W * SU.float().unsqueeze(1)
-    if out_features is not None and in_features is not None:
-        W = W[:out_features, :in_features]
-    return W.half()
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -245,10 +219,6 @@ class GLQShardedParameter(BasevLLMParameter):
     def load_column_parallel_weight(self, loaded_weight: torch.Tensor):
         if len(self._shard_data) == 1:
             self._shard_data[0].copy_(loaded_weight)
-        else:
-            # Unsplit fused weight (e.g. Mamba in_proj stored as single tensor).
-            # Stash for dequantization in process_weights_after_loading.
-            self._unsplit_weight = loaded_weight.clone()
 
     @property
     def weight_loader(self) -> Callable:
@@ -522,38 +492,6 @@ class GLQLinearMethod(LinearMethodBase):
         device = next(layer.parameters()).device
         bpw = getattr(layer, "glq_bpw", 2)
 
-        # Unsplit fused layers (e.g. Mamba in_proj): checkpoint stores a
-        # single GLQ tensor but the layer has multi-shard buffers.
-        # Dequantize to dense fp16 and use F.linear at inference time.
-        if (getattr(layer, "glq_is_fused", False)
-                and hasattr(layer.Qidxs, "_unsplit_weight")):
-            cb = E8ShellCodebook(device="cpu", verbose=False)
-            q = layer.Qidxs._unsplit_weight.cpu()
-            su = layer.SU._unsplit_weight.cpu()
-            sv = layer.SV._unsplit_weight.cpu()
-            ws = layer.Wscale._unsplit_weight.cpu()
-            inv_rs_t = getattr(layer.inv_resid_scale, "_unsplit_weight", None)
-            inv_rs = inv_rs_t.cpu().item() if inv_rs_t is not None and inv_rs_t.numel() == 1 else 0.0
-            q2 = layer.Qidxs2._unsplit_weight.cpu() if (
-                inv_rs != 0.0 and hasattr(layer.Qidxs2, "_unsplit_weight")
-            ) else None
-            cb2 = cb if inv_rs != 0.0 else None
-            out_sz = sum(layer.glq_shard_sizes)
-            in_sz = layer.glq_in_features
-            weight = _dequantize_glq_weight(
-                q, su, sv, ws, cb,
-                Qidxs2=q2, inv_resid_scale=inv_rs, codebook2=cb2,
-                out_features=out_sz, in_features=in_sz,
-            )
-            layer.weight = torch.nn.Parameter(
-                weight.to(device), requires_grad=False,
-            )
-            layer._glq_use_dense = True
-            for attr in ["Qidxs", "SU", "SV", "Wscale", "Qidxs2", "inv_resid_scale"]:
-                if hasattr(layer, attr):
-                    delattr(layer, attr)
-            return
-
         # Determine max_bpw across all shards
         max_bpw = 2
         if getattr(layer, "glq_is_fused", False):
@@ -632,10 +570,6 @@ class GLQLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # Dequantized Mamba layers — standard dense matmul
-        if getattr(layer, "_glq_use_dense", False):
-            return F.linear(x, layer.weight.to(x.dtype), bias)
-
         orig_shape = x.shape
         in_features = layer.glq_in_features
         x = x.reshape(-1, in_features)

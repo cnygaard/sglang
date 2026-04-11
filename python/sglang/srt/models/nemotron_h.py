@@ -782,68 +782,6 @@ class NemotronHForCausalLM(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
-    def _dequantize_glq_experts(self, weights):
-        """Wrapper that dequantizes GLQ-compressed expert weights to dense.
-
-        Collects per-expert GLQ buffers (Qidxs, SU, SV, Wscale, etc.),
-        dequantizes each sublayer to a dense fp16 tensor, and yields it
-        with a standard '.weight' suffix so FusedMoE can load it normally.
-        Non-expert and non-GLQ weights are yielded unchanged.
-        """
-        hidden = self.config.hidden_size
-        moe_inter = self.config.moe_intermediate_size
-        _GLQ_SUFFIXES = (".Qidxs", ".SU", ".SV", ".Wscale",
-                         ".Qidxs2", ".inv_resid_scale")
-        expert_bufs = {}  # base_name -> {suffix: tensor}
-
-        def _flush_expert(base, bufs):
-            from glq.codebook import E8ShellCodebook
-            from glq.hadamard import _pytorch_fht
-            cb = E8ShellCodebook(device="cpu", verbose=False)
-            q = bufs[".Qidxs"]
-            su, sv, ws = bufs[".SU"], bufs[".SV"], bufs[".Wscale"]
-            m_pad, n_blocks = q.shape
-            n_pad = n_blocks * 8
-            W = cb.decode(q.long().reshape(-1)).reshape(m_pad, n_pad).float()
-            q2 = bufs.get(".Qidxs2")
-            inv_rs = bufs.get(".inv_resid_scale")
-            inv_rs_val = inv_rs.item() if inv_rs is not None and inv_rs.numel() == 1 else 0.0
-            if q2 is not None and inv_rs_val != 0.0:
-                W2 = cb.decode(q2.long().reshape(-1)).reshape(m_pad, n_pad).float()
-                W = W + W2 * inv_rs_val
-            W = W * ws.float()
-            W = _pytorch_fht(W.clone())
-            W = W * sv.float().unsqueeze(0)
-            W = _pytorch_fht(W.T.clone()).T
-            W = W * su.float().unsqueeze(1)
-            # Crop to unpadded shape using model config
-            if "up_proj" in base:
-                W = W[:moe_inter, :hidden]
-            elif "down_proj" in base:
-                W = W[:hidden, :moe_inter]
-            return base + ".weight", W.half()
-
-        for name, tensor in weights:
-            is_glq_expert = False
-            for sfx in _GLQ_SUFFIXES:
-                if sfx in name and ".experts." in name:
-                    base = name[:name.rindex(sfx)]
-                    if base not in expert_bufs:
-                        expert_bufs[base] = {}
-                    expert_bufs[base][sfx] = tensor.cpu()
-                    is_glq_expert = True
-                    break
-            if is_glq_expert:
-                continue
-            yield name, tensor
-
-        # Flush remaining expert buffers
-        for base in sorted(expert_bufs.keys()):
-            bufs = expert_bufs[base]
-            if ".Qidxs" in bufs:
-                dname, dtensor = _flush_expert(base, bufs)
-                yield dname, dtensor
-
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False
     ) -> None:
@@ -859,13 +797,6 @@ class NemotronHForCausalLM(nn.Module):
         )
 
         params_dict = dict(self.named_parameters())
-
-        # If checkpoint contains GLQ-compressed expert weights, dequantize
-        # them to dense fp16 so FusedMoE can load them via standard path.
-        if self.quant_config is not None and getattr(
-            self.quant_config, "get_name", lambda: ""
-        )() == "glq":
-            weights = self._dequantize_glq_experts(weights)
 
         # Stream weights directly from the generator to avoid buffering
         # the entire checkpoint (~75 GB) into a Python list. On unified-
