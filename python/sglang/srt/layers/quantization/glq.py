@@ -119,7 +119,12 @@ def _make_glq_param(tensor: torch.Tensor) -> torch.nn.Parameter:
 
 
 def _register_glq_buffers(layer, prefix: str, out_size: int, in_size: int):
-    """Register one set of GLQ compressed buffers on the layer."""
+    """Register one set of GLQ compressed buffers on the layer.
+
+    Includes stage-3 and stage-4 RVQ buffers so 5-8 bpw (Phase D) checkpoints
+    load cleanly. Unused stages are zero-initialised and the forward path
+    skips them based on the per-layer ``_glq_n_stages`` metadata.
+    """
     m_pad = _glq_pad(out_size)
     n_pad = _glq_pad(in_size)
     n_blocks = n_pad // 8
@@ -135,6 +140,16 @@ def _register_glq_buffers(layer, prefix: str, out_size: int, in_size: int):
     setattr(layer, f"Qidxs2{p}", _make_glq_param(
         torch.zeros(m_pad, n_blocks, dtype=torch.int16)))
     setattr(layer, f"inv_resid_scale{p}", _make_glq_param(
+        torch.zeros((), dtype=torch.float32)))
+    # Phase D: N-stage RVQ for 5-8 bpw. Zero buffers are safe to ship —
+    # forward() only reads them when _glq_n_stages >= 3 / >= 4.
+    setattr(layer, f"Qidxs3{p}", _make_glq_param(
+        torch.zeros(m_pad, n_blocks, dtype=torch.int16)))
+    setattr(layer, f"inv_resid_scale2{p}", _make_glq_param(
+        torch.zeros((), dtype=torch.float32)))
+    setattr(layer, f"Qidxs4{p}", _make_glq_param(
+        torch.zeros(m_pad, n_blocks, dtype=torch.int16)))
+    setattr(layer, f"inv_resid_scale3{p}", _make_glq_param(
         torch.zeros((), dtype=torch.float32)))
     return m_pad, n_pad
 
@@ -262,11 +277,14 @@ def _glq_apply_shard(
     x, device, cb, cb2, Qidxs, SU, SV, wscale,
     has_stage2, inv_rs, Qidxs2, out_features, in_features,
     m_pad, n_pad, log_n, log_m,
+    Qidxs3=None, inv_rs2=0.0, Qidxs4=None, inv_rs3=0.0,
 ):
     """Full GLQ forward for one set of weight buffers.
 
     Uses CUDA C kernels from glq.inference_kernel._glq_cuda when available,
-    falling back to Triton for n_pad > 16384.
+    falling back to Triton for n_pad > 16384. Stages 3-4 (Phase D, 5-8 bpw)
+    reuse the primary 65536-entry E8 codebook — matches the convention in
+    glq.quantized_linear's fallback path.
     """
     dtype = x.dtype
     B = x.shape[0]
@@ -281,6 +299,10 @@ def _glq_apply_shard(
         SV = SV.to(device)
     if Qidxs2 is not None and Qidxs2.device != x.device:
         Qidxs2 = Qidxs2.to(device)
+    if Qidxs3 is not None and Qidxs3.device != x.device:
+        Qidxs3 = Qidxs3.to(device)
+    if Qidxs4 is not None and Qidxs4.device != x.device:
+        Qidxs4 = Qidxs4.to(device)
 
     # Input RHT: x (B,in_features) → x_rht (B,n_pad) fp32
     x_rht = torch.empty(B, n_pad, dtype=torch.float32, device=device)
@@ -300,11 +322,17 @@ def _glq_apply_shard(
     # Dequant + matmul: x_rht (B,n_pad) → y_rht (B,m_pad) fp32
     cb_packed = getattr(cb, "codebook_packed", None)
     cb2_half = cb2.codebook_half if has_stage2 and cb2 is not None else None
+    # Stages 3+ reuse the primary E8 codebook (65536 entries).
+    primary_cb = cb.codebook_half
+    cb3_arg = primary_cb if Qidxs3 is not None else None
+    cb4_arg = primary_cb if Qidxs4 is not None else None
 
     y_rht = glq_dequant_matmul(
-        x_rht, Qidxs, cb.codebook_half, wscale,
+        x_rht, Qidxs, primary_cb, wscale,
         Qidxs2=Qidxs2, codebook2=cb2_half,
         inv_resid_scale=inv_rs, codebook_packed=cb_packed,
+        Qidxs3=Qidxs3, codebook3=cb3_arg, inv_resid_scale2=inv_rs2,
+        Qidxs4=Qidxs4, codebook4=cb4_arg, inv_resid_scale3=inv_rs3,
     )
 
     # Output RHT: y_rht (B,m_pad) → y (B,out_features)
@@ -343,12 +371,22 @@ def _glq_apply_single(x, layer, prefix, cb, cb2, device):
     in_features = getattr(layer, f"_glq_in{prefix}")
 
     Qidxs2 = getattr(layer, f"Qidxs2{prefix}").to(device) if has_stage2 else None
+    # Phase D N-stage: stage 3/4 tensors when _glq_n_stages >= 3 / 4.
+    n_stages = getattr(layer, f"_glq_n_stages{prefix}", 2 if has_stage2 else 1)
+    inv_rs2 = getattr(layer, f"_glq_inv_rs2{prefix}", 0.0)
+    inv_rs3 = getattr(layer, f"_glq_inv_rs3{prefix}", 0.0)
+    Qidxs3 = (getattr(layer, f"Qidxs3{prefix}").to(device)
+              if n_stages >= 3 else None)
+    Qidxs4 = (getattr(layer, f"Qidxs4{prefix}").to(device)
+              if n_stages >= 4 else None)
     return _glq_apply_shard(
         x, device, cb, cb2,
         Qidxs=Qidxs, SU=SU, SV=SV, wscale=wscale,
         has_stage2=has_stage2, inv_rs=inv_rs, Qidxs2=Qidxs2,
         out_features=out_features, in_features=in_features,
         m_pad=m_pad, n_pad=n_pad, log_n=log_n, log_m=log_m,
+        Qidxs3=Qidxs3, inv_rs2=inv_rs2,
+        Qidxs4=Qidxs4, inv_rs3=inv_rs3,
     )
 
 
@@ -471,6 +509,24 @@ class GLQLinearMethod(LinearMethodBase):
                 [1] * len(output_partition_sizes), 0, torch.float32,
                 weight_loader=weight_loader,
             )
+            # Phase D: N-stage RVQ — stage 3 (5/6bpw) and stage 4 (7/8bpw).
+            # Zero-initialised; forward skips them when _glq_n_stages < 3 / 4.
+            layer.Qidxs3 = GLQShardedParameter(
+                output_partition_sizes, n_blocks, torch.int16,
+                weight_loader=weight_loader,
+            )
+            layer.inv_resid_scale2 = GLQShardedParameter(
+                [1] * len(output_partition_sizes), 0, torch.float32,
+                weight_loader=weight_loader,
+            )
+            layer.Qidxs4 = GLQShardedParameter(
+                output_partition_sizes, n_blocks, torch.int16,
+                weight_loader=weight_loader,
+            )
+            layer.inv_resid_scale3 = GLQShardedParameter(
+                [1] * len(output_partition_sizes), 0, torch.float32,
+                weight_loader=weight_loader,
+            )
 
             layer.glq_n_pad = n_pad
 
@@ -507,8 +563,9 @@ class GLQLinearMethod(LinearMethodBase):
         _ensure_codebook(device, max_bpw=max_bpw)
         _try_load_cuda_ext()
 
-        # Ensure all weight tensors on GPU
-        for attr in ["Qidxs", "SU", "SV", "Wscale", "Qidxs2", "inv_resid_scale"]:
+        # Ensure all weight tensors on GPU (includes Phase D stage 3/4).
+        for attr in ["Qidxs", "SU", "SV", "Wscale", "Qidxs2", "inv_resid_scale",
+                     "Qidxs3", "inv_resid_scale2", "Qidxs4", "inv_resid_scale3"]:
             t = getattr(layer, attr, None)
             if t is not None and hasattr(t, "device") and t.device != device:
                 setattr(
@@ -524,10 +581,26 @@ class GLQLinearMethod(LinearMethodBase):
                 out_sz = layer.glq_shard_sizes[i]
                 m_pad = _glq_pad(out_sz)
                 inv_rs_val = layer.inv_resid_scale.get_shard(i).item()
+                # Phase D: detect active stage count from non-zero inv_resid_scale*.
+                inv_rs2_val = (layer.inv_resid_scale2.get_shard(i).item()
+                               if hasattr(layer, "inv_resid_scale2") else 0.0)
+                inv_rs3_val = (layer.inv_resid_scale3.get_shard(i).item()
+                               if hasattr(layer, "inv_resid_scale3") else 0.0)
+                if inv_rs3_val != 0.0:
+                    n_stages = 4
+                elif inv_rs2_val != 0.0:
+                    n_stages = 3
+                elif inv_rs_val != 0.0:
+                    n_stages = 2
+                else:
+                    n_stages = 1
                 layer._glq_shard_meta.append({
                     "wscale": layer.Wscale.get_shard(i).item(),
                     "has_stage2": inv_rs_val != 0.0,
                     "inv_rs": inv_rs_val,
+                    "n_stages": n_stages,
+                    "inv_rs2": inv_rs2_val,
+                    "inv_rs3": inv_rs3_val,
                     "out": out_sz,
                     "in": layer.glq_in_features,
                     "m_pad": m_pad,
@@ -540,6 +613,21 @@ class GLQLinearMethod(LinearMethodBase):
             layer._glq_wscale = layer.Wscale.item()
             layer._glq_has_stage2 = inv_rs != 0.0
             layer._glq_inv_rs = inv_rs
+            # Phase D: detect N-stage from non-zero inv_resid_scale*.
+            inv_rs2 = (layer.inv_resid_scale2.item()
+                       if hasattr(layer, "inv_resid_scale2") else 0.0)
+            inv_rs3 = (layer.inv_resid_scale3.item()
+                       if hasattr(layer, "inv_resid_scale3") else 0.0)
+            if inv_rs3 != 0.0:
+                layer._glq_n_stages = 4
+            elif inv_rs2 != 0.0:
+                layer._glq_n_stages = 3
+            elif inv_rs != 0.0:
+                layer._glq_n_stages = 2
+            else:
+                layer._glq_n_stages = 1
+            layer._glq_inv_rs2 = inv_rs2
+            layer._glq_inv_rs3 = inv_rs3
             if hasattr(layer, "Qidxs") and layer.Qidxs.dim() == 2:
                 layer._glq_m_pad = layer.Qidxs.shape[0]
                 layer._glq_n_pad = layer.Qidxs.shape[1] * 8
@@ -580,6 +668,11 @@ class GLQLinearMethod(LinearMethodBase):
             shard_outputs = []
             for i in range(layer.glq_num_shards):
                 meta = layer._glq_shard_meta[i]
+                n_stages = meta.get("n_stages", 2 if meta["has_stage2"] else 1)
+                Qidxs3 = (layer.Qidxs3.get_shard(i)
+                          if n_stages >= 3 and hasattr(layer, "Qidxs3") else None)
+                Qidxs4 = (layer.Qidxs4.get_shard(i)
+                          if n_stages >= 4 and hasattr(layer, "Qidxs4") else None)
                 y_shard = _glq_apply_shard(
                     x, device, cb, cb2,
                     Qidxs=layer.Qidxs.get_shard(i),
@@ -595,6 +688,8 @@ class GLQLinearMethod(LinearMethodBase):
                     n_pad=meta["n_pad"],
                     log_n=meta["log_n"],
                     log_m=meta["log_m"],
+                    Qidxs3=Qidxs3, inv_rs2=meta.get("inv_rs2", 0.0),
+                    Qidxs4=Qidxs4, inv_rs3=meta.get("inv_rs3", 0.0),
                 )
                 shard_outputs.append(y_shard)
             y = torch.cat(shard_outputs, dim=-1)
